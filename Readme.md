@@ -17,7 +17,7 @@ EC2-AUTOMATION_JEN/
 ├── lambda_handler.py         # Lambda function code
 ├── lambda.zip                # Packaged Lambda deployment
 ├── screenshots
-
+├── Readme.md
 ```
 
 ---
