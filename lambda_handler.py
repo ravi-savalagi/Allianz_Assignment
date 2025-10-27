@@ -1,128 +1,134 @@
 import json
 import boto3
+import os
+import time
 from botocore.exceptions import ClientError
+import uuid
+
 
 ec2 = boto3.client('ec2', region_name='us-east-1')
+secrets = boto3.client('secretsmanager')
 
 def lambda_handler(event, context):
-    # Parse event for API Gateway v2.0 (wrapped 'body' string) or direct console/CLI tests
     try:
-        if 'body' in event and isinstance(event['body'], str):
-            # API call: Unwrap the body string (e.g., from curl/app.py)
-            body = json.loads(event['body'])
-        else:
-            # Direct test: Use event as-is (e.g., Lambda console raw JSON)
-            body = event
+        body = json.loads(event.get('body', '{}'))
+    except Exception:
+        return response(400, {'error': 'Invalid JSON in request body'})
 
-        action = body.get('action')
-        instance_id = body.get('instance_id')
-    except json.JSONDecodeError:
-        return response(400, {'error': 'Invalid JSON in request body. Use {"action": "create"} or similar.'})
-    except Exception as e:
-        return response(500, {'error': f'Failed to parse request: {str(e)}'})
+    action = body.get('action')
+    name = body.get('name', 'ec2-instance')  # Default name if not provided
+    instance_id = body.get('instance_id')
+    ami_id = os.getenv('ami_id')  # From Lambda environment variable
+    instance_type = 't3.micro'
+
+    if not action:
+        return response(400, {'error': 'Action is required'})
+    
+    key_name = f"{name}-key-{str(uuid.uuid4())[:8]}"
+    sg_name = f"{name}-ssh-sg"
 
     try:
-        if action == 'start':
-            if not instance_id:
-                return response(400, {'error': 'Missing "instance_id" for start'})
+        if action == 'create':
+            # Step 1: Create Key Pair
+            try:
+                key_pair = ec2.create_key_pair(KeyName=key_name)
+                private_key = key_pair['KeyMaterial']
+                secrets.create_secret(Name=key_name, SecretString=private_key)
+            except ClientError as e:
+                if 'InvalidKeyPair.Duplicate' in str(e):
+                    return response(400, {'error': f"Key '{key_name}' already exists"})
+                else:
+                    return response(500, {'error': f"Key creation error: {str(e)}"})
 
-            # Check current state
-            desc = ec2.describe_instances(InstanceIds=[instance_id])
-            state = desc['Reservations'][0]['Instances'][0]['State']['Name']
+            # Step 2: Create Security Group
+            try:
+                sg_result = ec2.create_security_group(
+                    GroupName=sg_name,
+                    Description='Allow SSH only',
+                    VpcId=get_default_vpc_id()
+                )
+                sg_id = sg_result['GroupId']
+                ec2.authorize_security_group_ingress(
+                    GroupId=sg_id,
+                    IpPermissions=[{
+                        'IpProtocol': 'tcp',
+                        'FromPort': 22,
+                        'ToPort': 22,
+                        'IpRanges': [{'CidrIp': '0.0.0.0/0'}]  # Replace with user's IP for security
+                    }]
+                )
+            except ClientError as e:
+                if 'InvalidGroup.Duplicate' in str(e):
+                    sg_id = get_security_group_id(sg_name)
+                else:
+                    return response(500, {'error': f"Security group error: {str(e)}"})
 
-            if state == 'stopped':
-                ec2.start_instances(InstanceIds=[instance_id])
-                # Wait for running (like in create)
+            # Step 3: Launch EC2 Instance
+            try:
+                ec2_result = ec2.run_instances(
+                    ImageId=ami_id,
+                    InstanceType=instance_type,
+                    MinCount=1,
+                    MaxCount=1,
+                    KeyName=key_name,
+                    SecurityGroupIds=[sg_id]
+                )
+                instance_id = ec2_result['Instances'][0]['InstanceId']
                 waiter = ec2.get_waiter('instance_running')
                 waiter.wait(InstanceIds=[instance_id])
-                return response(200, {'message': f'Started instance {instance_id}'})
-            elif state == 'running':
-                return response(200, {'message': f'Instance {instance_id} is already running'})
-            elif state == 'stopping':
-                return response(202, {'message': f"Instance {instance_id} is currently stopping. Please try starting it again shortly."})
+                desc = ec2.describe_instances(InstanceIds=[instance_id])
+                public_ip = desc['Reservations'][0]['Instances'][0]['PublicIpAddress']
+            except Exception as e:
+                return response(500, {'error': f"EC2 launch error: {str(e)}"})
 
-            elif state in ['shutting-down', 'terminated']:
-                return response(400, {'error': f"Cannot start instance {instance_id} because it is in state: {state}"})
-            else:
-                return response(400, {'error': f"Cannot start instance in state: {state}"})
+            ssh_command = f"ssh -i <downloaded-key>.pem ec2-user@{public_ip}"
+            return response(200, {
+                'message': f'Created instance {instance_id}',
+                'data': {
+                    'instance_id': instance_id,
+                    'public_ip': public_ip,
+                    'ssh_command': ssh_command,
+                    'ssh_key_secret': key_name
+                }
+            })
+
+        elif action == 'start':
+            if not instance_id:
+                return response(400, {'error': 'Instance ID is required for start'})
+            ec2.start_instances(InstanceIds=[instance_id])
+            return response(200, {'message': f'Instance {instance_id} started'})
 
         elif action == 'stop':
             if not instance_id:
-                return response(400, {'error': 'Missing "instance_id" for stop'})
-
-            try:
-                desc = ec2.describe_instances(InstanceIds=[instance_id])
-                state = desc['Reservations'][0]['Instances'][0]['State']['Name']
-
-                if state == 'running':
-                    ec2.stop_instances(InstanceIds=[instance_id])
-                    # Wait for stopped
-                    waiter = ec2.get_waiter('instance_stopped')
-                    waiter.wait(InstanceIds=[instance_id])
-                    return response(200, {'message': f'Stopped instance {instance_id}'})
-                elif state == 'stopped':
-                    return response(200, {'message': f'Instance {instance_id} is already stopped'})
-                elif state == 'terminated':
-                    return response(400, {'error': f'Cannot stop instance {instance_id} because it is terminated'})
-                else:
-                    return response(400, {'error': f'Cannot stop instance in state: {state}'})
-            except Exception as e:
-                return response(500, {'error': f'Error: {str(e)}'})
+                return response(400, {'error': 'Instance ID is required for stop'})
+            ec2.stop_instances(InstanceIds=[instance_id])
+            return response(200, {'message': f'Instance {instance_id} stopped'})
 
         elif action == 'terminate':
             if not instance_id:
-                return response(400, {'error': 'Missing "instance_id" for terminate'})
-
-            try:
-                desc = ec2.describe_instances(InstanceIds=[instance_id])
-                state = desc['Reservations'][0]['Instances'][0]['State']['Name']
-
-                if state == 'terminated':
-                    return response(400, {'error': f'Instance {instance_id} is already terminated'})
-                else:
-                    ec2.terminate_instances(InstanceIds=[instance_id])
-                    # Wait for terminated
-                    waiter = ec2.get_waiter('instance_terminated')
-                    waiter.wait(InstanceIds=[instance_id])
-                    return response(200, {'message': f'Terminated instance {instance_id}'})
-            except Exception as e:
-                return response(500, {'error': f'Error: {str(e)}'})
-
-        elif action == 'create':
-            key_name = 'my_keypair'
-            new_instance = ec2.run_instances(
-                ImageId='ami-052064a798f08f0d3',  # Verify/update: Amazon Linux 2 in us-east-1
-                InstanceType='t3.micro',
-                MinCount=1,
-                MaxCount=1,
-                KeyName=key_name,
-                SecurityGroupIds=['sg-0f66c9807f2d88f49']  # <-- REPLACE WITH YOUR SG ID (e.g., sg-0abc123def456)
-            )
-            instance = new_instance['Instances'][0]
-            instance_id = instance['InstanceId']
-
-            # Wait for instance to be running and get public IP
-            waiter = ec2.get_waiter('instance_running')
-            waiter.wait(InstanceIds=[instance_id])
-
-            # Fetch instance details
+                return response(400, {'error': 'Instance ID is required for terminate'})
             desc = ec2.describe_instances(InstanceIds=[instance_id])
-            public_ip = desc['Reservations'][0]['Instances'][0].get('PublicIpAddress')
-            ssh_command = f"ssh -i my_keypair.pem ec2-user@{public_ip}"  # Hardcoded key name
-            ssh_info = {
-                "instance_id": instance_id,
-                "public_ip": public_ip,
-                "username": "ec2-user",  
-                "key_name": "my_keypair",
-                "ssh_command": ssh_command
-            }
+            instance = desc['Reservations'][0]['Instances'][0]
+            sg_id = instance['SecurityGroups'][0]['GroupId']
 
-            return response(200, {'message': f'Created instance {instance_id}', 'data': ssh_info})
+            ec2.terminate_instances(InstanceIds=[instance_id])
+            while True:
+                check_result = ec2.describe_instances(InstanceIds=[instance_id])
+                state = check_result['Reservations'][0]['Instances'][0]['State']['Name']
+                if state == 'terminated':
+                    break
+                time.sleep(5)
 
-        elif action == 'list':  # New: List all instances (optional; remove if not needed)
-            describe_response = ec2.describe_instances()
+            ec2.delete_security_group(GroupId=sg_id)
+            secrets.delete_secret(SecretId=key_name, ForceDeleteWithoutRecovery=True)
+            ec2.delete_key_pair(KeyName=key_name)
+
+            return response(200, {'message': f'Instance {instance_id} terminated and resources cleaned up'})
+
+        elif action == 'list':
+            list_result = ec2.describe_instances()
             instances = []
-            for reservation in describe_response['Reservations']:
+            for reservation in list_result['Reservations']:
                 for instance in reservation['Instances']:
                     instances.append({
                         'instance_id': instance['InstanceId'],
@@ -133,25 +139,25 @@ def lambda_handler(event, context):
             return response(200, {'message': f'Found {len(instances)} instances', 'data': instances})
 
         else:
-            return response(400, {'error': 'Invalid action. Use start, stop, terminate, create, or list.'})
+            return response(400, {'error': 'Invalid action'})
 
-    except ClientError as e:
-        error_code = e.response['Error']['Code']
-        if 'InvalidKeyPair.NotFound' in error_code:
-            return response(400, {'error': 'Key pair "my_keypair" not found. Create it in EC2 Console > Key Pairs.'})
-        elif 'InvalidGroup.NotFound' in error_code:
-            return response(400, {'error': 'Security group ID invalid. Update in code and re-deploy.'})
-        else:
-            return response(500, {'error': f'AWS Error ({error_code}): {e.response["Error"]["Message"]}'})
     except Exception as e:
         return response(500, {'error': f'Error: {str(e)}'})
+
+def get_default_vpc_id():
+    vpcs = ec2.describe_vpcs(Filters=[{'Name': 'isDefault', 'Values': ['true']}])
+    return vpcs['Vpcs'][0]['VpcId']
+
+def get_security_group_id(group_name):
+    sgs = ec2.describe_security_groups(Filters=[{'Name': 'group-name', 'Values': [group_name]}])
+    return sgs['SecurityGroups'][0]['GroupId']
 
 def response(status, message):
     return {
         'statusCode': status,
-        'headers': {  # Added CORS for API Gateway + app.py/browser
+        'headers': {
             'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',  # Allow all for demo (restrict in prod)
+            'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'POST, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type, Authorization',
         },
