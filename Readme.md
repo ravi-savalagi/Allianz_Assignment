@@ -12,10 +12,11 @@ EC2-AUTOMATION_JEN/
 │   ├── outputs.tf            # Terraform outputs
 │   ├── provider.tf           # AWS provider setup
 │   ├── variables.tf          # Input variables
-├── app.py                    # Flask UI for EC2 control
-├── lambda_api_runner.py      # Jenkins runner script
-├── lambda_handler.py         # Lambda function code
-├── lambda.zip                # Packaged Lambda deployment
+│   ├──src
+│    ├── app.py                    # Flask UI for EC2 control
+│    ├── lambda_api_runner.py      # Jenkins runner script
+│    ├── lambda_handler.py         # Lambda function code
+├── lambda.zip                     # Packaged Lambda deployment
 ├── screenshots
 ├── Readme.md
 ```
