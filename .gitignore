@@ -1,6 +1,6 @@
 # Ignore Terraform folders and state files
 terraform/
-terraform/terraform.lock.hcl
+terraform/.terraform.lock.hcl
 terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/tfplan
