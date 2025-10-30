@@ -18,7 +18,9 @@ def call_api(action, instance_id=None):
         payload['allowed_cidr'] = MY_IP  # Uses your IP for SSH access
     
     headers = {'Content-Type': 'application/json'}
-    response = requests.post(f"{ENDPOINT}/", json=payload, headers=headers)
+    # response = requests.post(f"{ENDPOINT}/", json=payload, headers=headers)
+    response = requests.post(f"{ENDPOINT}/", json=payload, headers=headers, verify=False)
+
     
     try:
         data = response.json()
